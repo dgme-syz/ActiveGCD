@@ -1,0 +1,8 @@
+old: 
+  - known_classes
+
+new: 
+  unknown_classes: 
+    - Hard
+    - Easy
+    - Medium
