@@ -9,6 +9,10 @@ MAPPING_NAME_TO_KEY = OrderedDict([
     ('CIFAR10', ('img', 'label')),  
 ])
 
+MAPPING_NAME_TO_SPLIT = OrderedDict([
+    ('CIFAR10', ('train', 'test')),  
+])
+
 MAPPING_NAME_TO_CLS = OrderedDict([
     ('CIFAR10', 10),   
 ])
@@ -20,6 +24,11 @@ def is_fgvc_dataset(name: str) -> bool:
     """ check if the dataset is an FGVC dataset """
     
     return name in FGVC_DATASET
+
+def get_splits(name: str) -> tuple[str, str]:
+    """ get the split names for the dataset """
+    
+    return MAPPING_NAME_TO_SPLIT[name]
 
 def get_info(name: str) -> tuple[str, tuple[str, str], int]:
     """ get the hub, key, and number of classes for the dataset """

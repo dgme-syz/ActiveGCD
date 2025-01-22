@@ -8,10 +8,44 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
-from utils import logger
-from utils import DINOHead
+from util import logger
+from util import DINOHead
 from data import GcdData
 
+def get_models(
+    mlp_output_dim: int, 
+    device: str, 
+    grad_from_block: int = 0,
+) -> tuple[nn.Module, nn.Module]:
+    """ Load the DINO model and the DINO EMA model."""
+    
+    backbone = torch.hub.load(
+        repo_or_dir='facebookresearch/dino:main', model='dino_vitb16',
+    )
+    for n, p in backbone.named_parameters():
+        if 'block' in n and int(n.split('.')[1]) >= grad_from_block:
+            p.requires_grad = True
+        else:
+            p.requires_grad = False
+    backbone_ema = deepcopy(backbone)
+                
+    model = nn.Sequential(
+        backbone, 
+        DINOHead(
+            in_dim=768, 
+            out_dim=mlp_output_dim, 
+            nlayers=3,
+        )
+    )
+    model_ema = nn.Sequential(
+        backbone_ema, 
+        DINOHead(
+            in_dim=768, 
+            out_dim=mlp_output_dim, 
+            nlayers=3,
+        )
+    )
+    return model.to(device), model_ema.to(device)
 
 def work(
     dataset: str = 'CIFAR10', 
@@ -69,31 +103,7 @@ def work(
         f"and {num_unlabeled_cls} unlabeled classes."
     )
     
-    
-    backbone = torch.hub.load(
-        repo_or_dir='facebookresearch/dino:main', 
-        model='dino_vitb16',
-    )
-    backbone_ema = torch.hub.load(
-        repo_or_dir='facebookresearch/dino:main', 
-        model='dino_vitb16',
-    )
-    model = nn.Sequential(
-        backbone, 
-        DINOHead(
-            in_dim=768, 
-            out_dim=mlp_output_dim, 
-            nlayers=3,
-        )
-    )
-    model_ema = nn.Sequential(
-        backbone_ema, 
-        DINOHead(
-            in_dim=768, 
-            out_dim=mlp_output_dim, 
-            nlayers=3,
-        )
-    )
+    model, model_ema = get_models(mlp_output_dim, device)
     logger.info("Model loaded.")
     
     
