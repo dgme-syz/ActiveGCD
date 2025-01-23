@@ -1,7 +1,9 @@
 import pickle
 from typing import Callable
 from typing import Optional
+from typing import Iterable
 from PIL import Image
+import warnings
 
 import yaml
 import torch
@@ -9,7 +11,6 @@ from datasets import load_dataset
 from datasets import Dataset
 from datasets import concatenate_datasets
 from torch.utils.data import Sampler
-from torch.utils.data import Iterable
 from torch.utils.data import DataLoader
 
 from .mapping import get_info
@@ -103,7 +104,7 @@ def get_class_splits(
         if not ((ssb_ratio is None) ^ (ssb_num_labels is None)):
             raise ValueError('Either ssb_ratio or ssb_num_labels should be specified')
         if is_fgvc_dataset(name):
-            Warning('The dataset is a FGVC dataset, but the use_ssb_splits is False')
+            warnings.warn('The dataset is a FGVC dataset, but the use_ssb_splits is False')
         
         if ssb_ratio is not None:
             split_num = int(num_labels * ssb_ratio)
@@ -158,13 +159,6 @@ def get_datasets(
     """
     if split_train_val < 0. or split_train_val >= 1.:
         raise ValueError('The split_train_val should be in the range [0, 1)')
-    if train_transform is None and test_transform is None:
-        train_transform, test_transform = get_transform(**kwargs)
-    elif (train_transform is None) ^ (test_transform is None):
-        raise ValueError(
-            f"We need to specify both train_transform and test_transform, "
-            f"or neither of them (use the default transform)."
-        )
     
     train_key, test_key = get_splits(name)
     train_data, test_data = dataset[train_key], dataset[test_key]
@@ -182,8 +176,6 @@ def get_datasets(
     # concatenate_datasets = copy, bot share the same memory
     unlabeled_train = concatenate_datasets([unlabeled_train, others])
     del others
-    
-    # set transform
     
     if split_train_val == 0.:
                 
@@ -215,8 +207,6 @@ class GcdData(object):
         yaml_path: str | None = None,
         prop_train_labels: float = 0.2,
         split_train_val: float = 0.,
-        train_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
-        test_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
     ): 
         self.name = dataset
         hub, keys, self.num_labels = get_info(dataset)
@@ -238,32 +228,48 @@ class GcdData(object):
             train_classes=self.old_classes,
             prop_train_labels=prop_train_labels,
             split_train_val=split_train_val,
-            train_transform=train_transform,
-            test_transform=test_transform,
         )
     
     
-    def get_dataloader(
+    def get_dataloaders(
         self, 
         per_device_train_batch_size: int = 128,
         per_device_eval_batch_size: int = 256,
         drop_last: bool = True,
         pin_memory: bool = True,
-        num_workers: int = 2,
+        num_workers: int = 0,
         sampler: Sampler | Iterable | None = None,
-    ) -> tuple[DataLoader, ...]:
-        """_summary_
+        train_tfm: Callable[[Image.Image], torch.Tensor] | None = None,
+        test_tfm: Callable[[Image.Image], torch.Tensor] | None = None,
+        **kwargs, 
+    ) -> DataLoaderOutput:
+        """ Get the dataloaders
 
+            If you are suprised by the 'collate' results, please ref to 
+            https://github.com/pytorch/pytorch/blob/main/torch/utils/data/_utils/collate.py
+            
         Args:
-            per_device_train_batch_size (`int`, optional): _description_. Defaults to 128.
-            per_device_eval_batch_size (`int`, optional): _description_. Defaults to 256.
-            drop_last (`bool`, optional): _description_. Defaults to True.
-            pin_memory (`bool`, optional): _description_. Defaults to True.
-            num_workers (`int`, optional): _description_. Defaults to 2.
-            sampler (`Sampler | Iterable | None`, optional): _description_. Defaults to None.
+            per_device_train_batch_size (`int`, optional): how many samples p-
+                er train batch in one device to load. Defaults to 128.
+            per_device_eval_batch_size (`int`, optional): how many samples p-
+                er eval(or test) batch in one device to load. Defaults to 256.
+            drop_last (`bool`, optional): set to ``True`` to drop the last in-
+                complete batch, if the dataset size is not divisible by the batch 
+                size. If ``False`` and the size of dataset is not divisible by the 
+                batch size, then the last batch will be smaller. Defaults to True.
+            pin_memory (`bool`, optional): If ``True``, the data loader will copy Tensors
+                into device/CUDA pinned memory before returning them. Defaults to True.
+            num_workers (`int`, optional): how many subprocesses to use for data
+                loading. ``0`` means that the data will be loaded in the main process. 
+                Defaults to 0.
+            sampler (`Sampler | Iterable | None`, optional): defines the strategy to draw
+                samples from the dataset. Can be any ``Iterable`` with ``__len__``
+                implemented. If specified, :attr:`shuffle` must not be specified.
+                Defaults to None.
 
         Returns:
-            `tuple[DataLoader, ...]`: _description_
+            `tuple[DataLoader, ...]`: The dataloaders for training, test, and validation.
+            see `DataLoaderOutput` for more details.
         """
         if sampler is None:
             label_len, unlabel_len = (len(self.dataset_dict.train_labeled), 
@@ -275,14 +281,45 @@ class GcdData(object):
             sampler = torch.utils.data.WeightedRandomSampler(
                 sample_weights, num_samples=train_len
             )
-        
+            
+        if train_tfm is None and test_tfm is None:
+            train_tfm, test_tfm = get_transform(**kwargs)
+        elif (train_tfm is None) ^ (test_tfm is None):
+            raise ValueError(
+                f"We need to specify both train_tfm and test_tfm, "
+                f"or neither of them (use the default transform)."
+            )
+            
+        if kwargs.get("name", None) == None:
+            kwargs["name"] = self.name # set by default
+        elif kwargs["name"] != self.name:
+            warnings.warn(
+                f"The name in kwargs is different from the name in the dataset"
+            )
+            
+        # add one new column to mark is labeled or not
         train = concatenate_datasets(
-            [self.dataset_dict.train_labeled, self.dataset_dict.train_unlabeled]
+            [
+                self.dataset_dict.train_labeled.map(
+                    function=lambda x: {'is_labeled': [1]*len(x[next(iter(x))]), **x}, batched=True
+                ), 
+                self.dataset_dict.train_unlabeled.map(
+                    function=lambda x: {'is_labeled': [0]*len(x[next(iter(x))]), **x}, batched=True
+                )
+            ]
         ) # copy, not share the same memory with the original data
         test_labeled, val = self.dataset_dict.test, self.dataset_dict.val
         
         test_unlabeled = self.dataset_dict.train_unlabeled
         train_labeled_ind_mapping = self.dataset_dict.train_labeled
+        
+        # set the transform
+        train.set_transform(train_tfm)
+        test_unlabeled.set_transform(test_tfm)
+        test_labeled.set_transform(test_tfm)
+        train_labeled_ind_mapping.set_transform(test_tfm)
+        if val is not None:
+            val.set_transform(test_tfm)
         
         train_loader = DataLoader(
             train,
@@ -291,7 +328,7 @@ class GcdData(object):
             pin_memory=pin_memory,
             num_workers=num_workers,
             sampler=sampler,
-            shuffle=True,
+            shuffle=False, 
         )
         
         test_loader_unlabeled = DataLoader(

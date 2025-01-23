@@ -1,9 +1,11 @@
 from typing import Callable
 from PIL import Image
-import warnings
+from functools import partial
 
 import torch
 from torchvision import transforms
+
+from .mapping import get_keys
 
 # ImageNet mean and std
 mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
@@ -28,7 +30,8 @@ class CLViewGen(object):
 
 
 def get_transform(
-    image_size: int = 32,
+    name: str = 'CIFAR10',
+    image_size: int = 224,
     crop_pct: float = 0.875, 
     interpolation: int = 3, 
     use_contrast: bool = True, 
@@ -59,6 +62,20 @@ def get_transform(
     
     if use_contrast:
         train_transform = CLViewGen(train_transform, n_views=n_views)
+    
+    image, label = get_keys(name=name)
+    def func(x: dict, function: Callable[[Image.Image], torch.Tensor]) -> dict:
+        # update, and then del image, label from x
+        img = [function(xx) for xx in x[image]]
+        lab = x[label]
+        x.pop(image), x.pop(label)
+        
+        return {"image": img, "label": lab, **x}
+    
+    train_transform = partial(
+        func, function=train_transform)
+    test_transform = partial(
+        func, function=test_transform)
     
     return train_transform, test_transform
 

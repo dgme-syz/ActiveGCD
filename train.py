@@ -7,17 +7,18 @@ from typing import Literal
 import torch
 from torch import nn
 from tqdm import tqdm
+from torch.utils.data import DataLoader
 
 from util import logger
 from util import DINOHead
 from data import GcdData
 
-def get_models(
+def get_model(
     mlp_output_dim: int, 
     device: str, 
     grad_from_block: int = 0,
-) -> tuple[nn.Module, nn.Module]:
-    """ Load the DINO model and the DINO EMA model."""
+) -> nn.Module:
+    """ Load the DINO model"""
     
     backbone = torch.hub.load(
         repo_or_dir='facebookresearch/dino:main', model='dino_vitb16',
@@ -27,7 +28,6 @@ def get_models(
             p.requires_grad = True
         else:
             p.requires_grad = False
-    backbone_ema = deepcopy(backbone)
                 
     model = nn.Sequential(
         backbone, 
@@ -37,16 +37,9 @@ def get_models(
             nlayers=3,
         )
     )
-    model_ema = nn.Sequential(
-        backbone_ema, 
-        DINOHead(
-            in_dim=768, 
-            out_dim=mlp_output_dim, 
-            nlayers=3,
-        )
-    )
     
-    return model.to(device), model_ema.to(device)
+    return model.to(device)
+
 
 def work(
     dataset: str = 'CIFAR10', 
@@ -90,6 +83,7 @@ def work(
     
     data = GcdData(
         dataset=dataset,
+        device=device,
         ssb_ratio=ssb_ratio,
         ssb_num_labels=ssb_num_labels,
         use_ssb_splits=use_ssb_splits,
@@ -103,14 +97,14 @@ def work(
         f"and {num_unlabeled_cls} unlabeled classes."
     )
     
-    model, model_ema = get_models(mlp_output_dim, device, grad_from_block)
+    model = get_model(mlp_output_dim, device, grad_from_block)
     logger.info("Model loaded.")
     
     (
         train_loader, 
         test_loader_unlabeled,
         test_loader_labeled,
-        train_labeled_loader_ind_mapping,
+        _,
         val_loader,
     ) = data.get_dataloaders(
         per_device_train_batch_size=per_device_train_batch_size,
@@ -119,6 +113,8 @@ def work(
         pin_memory=True,
         num_workers=num_workers,
     )
+    
+    
     
 
 if __name__ == '__main__':

@@ -30,6 +30,11 @@ def get_splits(name: str) -> tuple[str, str]:
     
     return MAPPING_NAME_TO_SPLIT[name]
 
+def get_keys(name: str) -> tuple[str, str]:
+    """ get the key names for the dataset """
+    
+    return MAPPING_NAME_TO_KEY[name]
+
 def get_info(name: str) -> tuple[str, tuple[str, str], int]:
     """ get the hub, key, and number of classes for the dataset """
     

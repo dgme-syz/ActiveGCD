@@ -1,10 +1,16 @@
 from dataclasses import dataclass
+from dataclasses import fields
+from collections import namedtuple
 
 from datasets import Dataset
 from torch.utils.data import DataLoader
 
+class Output:
+    def __iter__(self):
+        return iter([getattr(self, f.name) for f in fields(self)])
+
 @dataclass
-class DatasetOutput:
+class DatasetOutput(Output):
     """ The output of the `get_datasets` function """
     
     train_labeled: Dataset | None = None
@@ -13,7 +19,7 @@ class DatasetOutput:
     val: Dataset | None = None
     
 @dataclass
-class DataLoaderOutput:
+class DataLoaderOutput(Output):
     """ The output of the `get_dataloaders` function """
     
     train_loader: DataLoader | None = None
