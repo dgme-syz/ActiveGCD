@@ -3,9 +3,19 @@ import math
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 import numpy as np
 from tqdm import tqdm
 import transformers
+import torch.nn.functional as F
+from transformers import EvalPrediction
+
+from .training_args import TrainingArgs
+from train_module import (
+    DistillLoss,
+    info_nce_logits,
+    SupConLoss
+)
 
 def get_params_groups(model: nn.Module) -> list[dict]:
     """ Do not regularize biases nor Norm parameters """
@@ -25,52 +35,10 @@ def get_params_groups(model: nn.Module) -> list[dict]:
         {"params": not_reg, "weight_decay": 0.0},
     ]
     
-class DistillLoss(nn.Module):
-    def __init__(
-        self,
-        warmup_teacher_temp_epochs: int, 
-        n_epochs: int,
-        n_crops: int = 2, 
-        warmup_teacher_temp: float = 0.07,
-        teacher_temp: float = 0.04,
-        student_temp: float = 0.1, 
-    ):
-        """
-        Args:
-            warmup_teacher_temp_epochs (int): The number of epochs during which the teacher 
-                model's temperature gradually increases from `warmup_teacher_temp` to `teacher_temp`.
-            n_epochs (int): The total number of epochs for training the student model.
-            n_crops (int, optional): The number of crops (sub-images) per image for data 
-                augmentation. Defaults to 2.
-            warmup_teacher_temp (float, optional): The initial temperature for the teacher model 
-                during the warmup phase. Defaults to 0.07.
-            teacher_temp (float, optional): The final temperature for the teacher model after 
-                the warmup phase. Defaults to 0.04.
-            student_temp (float, optional): The temperature used for the student model to control 
-                the smoothness of the output logits. Defaults to 0.1.
-        """
-
-        super().__init__()
-        self.student_temp = student_temp
-        self.n_crops = n_crops
-        self.teacher_temp_schedule = np.concatenate((
-            np.linspace(
-                warmup_teacher_temp, 
-                teacher_temp,
-                warmup_teacher_temp_epochs
-            ), 
-            np.ones(n_epochs - warmup_teacher_temp_epochs) * teacher_temp
-        ))
-        
-    def forward(
-        self, 
-        student_outputs: torch.Tensor,
-        teacher_outputs: torch.Tensor,
-        epoch: int,
-    ):
-        """ Compute the distillation loss between the student and teacher outputs.  """
-
-        pass
+def compute_metrics(eval_preds: EvalPrediction) -> dict:
+    """ custom update metrics for test """
+    
+    pass
 
 
 class Trainer(transformers.Trainer):
@@ -78,12 +46,22 @@ class Trainer(transformers.Trainer):
     
     def __init__(
         self, 
+        eval_dataset: tuple[Dataset, Dataset],
+        *args, 
         **kwargs
     ):
-        pass
-    
-    def log(self, logs):
-        pass
+        super().__init__(*args, **kwargs)
+        # use args from parent class
+        self.args: TrainingArgs  = self.args
+        
+        self.cluster_criterion = DistillLoss(
+            warmup_teacher_temp_epochs=self.args.warmup_teacher_temp_epochs,
+            n_epochs=self.args.num_train_epochs,
+            n_crops=self.args.n_views,
+            warmup_teacher_temp=self.args.warmup_teacher_temp,
+            teacher_temp=self.args.teacher_temp,
+        )
+        self.eval_dataset = eval_dataset
     
     def prediction_step(
         self, 
@@ -92,20 +70,32 @@ class Trainer(transformers.Trainer):
         prediction_loss_only, 
         ignore_keys = None
     ):
-        pass
-    
+        self.evaluate(
+            eval_dataset=self.eval_dataset[0], 
+            metric_key_prefix="test"
+        )
+        self.evaluate(
+            eval_dataset=self.eval_dataset[1], 
+            metric_key_prefix="train unlabeled"
+        )
     
     def compute_loss(
         self, model, batch, return_outputs=False
     ):
-        images, labels, is_labeled = batch["image"], batch["label"], batch["is_labeled"]
+        (
+            images, 
+            labels, 
+            is_labeled
+        ) = batch["image"], batch["label"], batch["is_labeled"]
+        
         n_views, B, C, H, W = images.shape
+        
         labels = labels.to(model.device)
         is_labeled = is_labeled.to(model.device).bool()
-        images = images.to(model.device) # n_views x B x C x H x W
+        # reshape to (n_views * B, C, H, W)
+        images = torch.cat(images, dim=0).to(model.device)
         
-        student_proj = model[0](images)
-        student_outs = model[1](student_proj)
+        student_proj, student_outs = model(images) # stdent_proj: (n_views * B, hidden_dim)
         teacher_outs = student_outs.detach()
         
         # 1. supervised clustering
@@ -120,15 +110,43 @@ class Trainer(transformers.Trainer):
         )
         
         # 2. unsupervised clustering
-        unsupervised_cluster_loss = cluster_criterion(
-            student_outs, teacher_outs, epoch
+        unsupervised_cluster_loss = self.cluster_criterion(
+            student_outs, teacher_outs, int(self.state.epoch)
         )
         average_probs = (student_outs / 0.1).softmax(dim=1).mean(dim=0)
-        me_max_loss = -torch.sum(torch.log(average_probs ** (-average_probs))) + math.log(float(len(average_probs)))
-        unsupervised_cluster_loss += memax_weight * me_max_loss
+        log_probs = torch.log(average_probs ** (-average_probs))
+        me_max_loss = -torch.sum(log_probs) + math.log(float(len(average_probs)))
+        unsupervised_cluster_loss += self.args.memax_weight * me_max_loss
         
         # 3. unsupervised representation learning
-        contrastive_logits, constrastive_labels = 
+        unsup_con_logits, unsup_con_labels = info_nce_logits(
+            features=student_proj, n_views=n_views,
+        )
+        unsup_con_loss = nn.CrossEntropyLoss()(
+            input=unsup_con_logits, target=unsup_con_labels
+        )
+        
+        # 4. supervised representation learning
+        student_proj = torch.cat(
+            [student_proj[i][is_labeled] for i in range(n_views)], dim=1
+        ) # (B, hidden_dim * n_views)
+        student_proj = F.normalize(student_proj, dim=-1)
+        sup_con_labels = labels[is_labeled]
+        sup_con_loss = SupConLoss()(
+            features=student_proj, labels=sup_con_labels
+        )
+        
+        # 5. total loss
+        loss = (
+            (1 - self.args.sup_weight) * unsupervised_cluster_loss
+            + self.args.sup_weight * supervised_cluster_loss
+            + self.args.sup_weight * sup_con_loss +
+            (1 - self.args.sup_weight) * unsup_con_loss 
+        )
+        
+        return (loss, student_outs) if return_outputs else loss
+
+                
 
 
 def train(
@@ -167,13 +185,7 @@ def train(
         eta_min=learning_rate * 1e-3,
     )
     
-    cluster_criterion = DistillLoss(
-        warmup_teacher_temp_epochs=warmup_teacher_temp_epochs,
-        n_epochs=epochs,
-        n_crops=n_views,
-        warmup_teacher_temp=warmup_teacher_temp,
-        teacher_temp=teacher_temp,
-    )
+    
     
        
                 
