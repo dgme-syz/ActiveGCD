@@ -1,51 +1,12 @@
 from dataclasses import dataclass
 from dataclasses import field
+from typing import Literal
 
 from transformers import TrainingArguments
 
 @dataclass
 class TrainingArgs(TrainingArguments):
     """ Training Arguments """
-    
-    do_eval: bool = field(
-        default=True, 
-        metadata={
-            "help": (
-                "Whether to evaluate the model during training. Set to True for evaluation "
-                "after each epoch."
-            )
-        }
-    )
-    
-    learning_rate: float = field(
-        default=0.1, 
-        metadata={
-            "help": (
-                "The rate at which the model learns. A higher value means the model updates "
-                "its weights more drastically."
-            )
-        }
-    )
-    
-    momentum: float = field(
-        default=0.9, 
-        metadata={
-            "help": (
-                "The momentum factor for the optimizer. It helps accelerate gradient descent "
-                "in the right direction, leading to faster converging."
-            )
-        }
-    )
-    
-    weight_decay: float = field(
-        default=1e-4, 
-        metadata={
-            "help": (
-                "The weight decay (L2 penalty) for regularization. It helps prevent overfitting "
-                "by penalizing large weights."
-            )
-        }
-    )
     
     warmup_teacher_temp_epochs: int = field(
         default=30, 
@@ -106,3 +67,15 @@ class TrainingArgs(TrainingArguments):
             )
         }
     )
+
+    # "normal" or "balanced" or "mixed"
+    eval_func: Literal["normal", "balanced", "mixed"] = field(
+        default="normal", 
+        metadata={
+            "help": (
+                "The evaluation function to use. 'normal' computes the accuracy as a whole, 'balanced' "
+                "computes the accuracy for each class separately and averages, 'mixed' computes both."
+            )
+        }
+    )
+        

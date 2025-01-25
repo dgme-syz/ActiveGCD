@@ -23,10 +23,18 @@ class DataLoaderOutput(Output):
     """ The output of the `get_dataloaders` function """
     
     train_loader: DataLoader | None = None
-    test_loader_unlabeled: DataLoader | None = None
-    test_loader_labeled: DataLoader | None = None
+    test_loader_unlabeled_from_train: DataLoader | None = None
+    test_loader: DataLoader | None = None
     train_labeled_loader_ind_mapping: DataLoader | None = None
     val_loader: DataLoader | None = None
     
     
+@dataclass
+class DataOutput(Output):
+    """ The suboutput of the `get_dataloaders` function """
     
+    train: Dataset | None = None
+    test_unlabled_from_train: Dataset | None = None
+    test: Dataset | None = None
+    train_labeled_ind_mapping: Dataset | None = None
+    val: Dataset | None = None

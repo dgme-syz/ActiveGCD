@@ -1,16 +1,17 @@
-import os
 import argparse
-import math
-from copy import deepcopy
-from typing import Literal
 
+import yaml
 import torch
 from torch import nn
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
+from hprams import TrainConfig
+from hprams import DatasetConfig
+from hprams import split_params
 from util import logger
 from util import DINOHead
+from util import train
 from data import GcdData
 
 def get_model(
@@ -41,82 +42,69 @@ def get_model(
     return model.to(device)
 
 
-def work(
-    dataset: str = 'CIFAR10', 
-    device: str = 'cuda',
-    grad_from_block: int = 11, 
-    num_workers: int = 2, 
-    per_device_train_batch_size: int = 128, 
-    per_device_eval_batch_size: int = 256, 
-    output_dir: str = '/saves', 
-    ssb_ratio: float = 0.5,
-    ssb_num_labels: int | None = None,
-    use_ssb_splits: bool = False, 
-    pkl_path: str | None = None,
-    yaml_path: str | None = None,
-):
-    r"""a main function to start ActiveGCD
+def work(train_args: TrainConfig, data_args: DatasetConfig):
+    """ Process the dataset and call the training function. """
     
-    Process the dataset and call the training function.
-    
-    Args:
-        dataset (`str`, `optional`, defaults to `'CIFAR10'`): 
-            The dataset to use for training and evaluation. Choose between 'CIFAR10' and 'CIFAR100'.
-        device (`str`, `optional`, defaults to `'cuda'`): 
-            The device to run the model on (e.g., 'cuda' or 'cpu'). 
-        grad_from_block (`int`, `optional`, defaults to `11`): 
-            The block from which to start gradient calculations during training. 
-        num_workers (`int`, `optional`, defaults to `2`): 
-            The number of workers to use for data loading. 
-        per_device_train_batch_size (`int`, `optional`, defaults to `128`): 
-            The batch size per device during training. 
-        per_device_eval_batch_size (`int`, `optional`, defaults to `256`): 
-            The batch size per device during evaluation. 
-        output_dir (`str`, `optional`, defaults to `'/saves'`): 
-            The directory where the model and results will be saved. 
-        split_ratio (`float`, `optional`, defaults to `0.5`):
-            The ratio of the dataset used for labeled and the rest for unlabeled data.
-    """
-    
-    if device == 'cuda' and torch.cuda.is_available():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
     
     data = GcdData(
-        dataset=dataset,
+        dataset=data_args.dataset,
         device=device,
-        ssb_ratio=ssb_ratio,
-        ssb_num_labels=ssb_num_labels,
-        use_ssb_splits=use_ssb_splits,
-        pkl_path=pkl_path,
-        yaml_path=yaml_path,
+        ssb_ratio=data_args.ssb_ratio,
+        ssb_num_labels=data_args.ssb_num_labels,
+        use_ssb_splits=data_args.use_ssb_splits,
+        pkl_path=data_args.pkl_path,
+        yaml_path=data_args.pkl_info_path,
     )
     num_labeled_cls, num_unlabeled_cls = len(data.old_classes), len(data.new_classes)
     mlp_output_dim = num_labeled_cls + num_unlabeled_cls
     logger.info(
-        f"{dataset} loaded, include {num_labeled_cls} labeled classes" 
+        f"{data_args.dataset} loaded, include {num_labeled_cls} labeled classes" 
         f"and {num_unlabeled_cls} unlabeled classes."
     )
     
-    model = get_model(mlp_output_dim, device, grad_from_block)
+    model = get_model(mlp_output_dim, device, train_args.grad_from_block)
     logger.info("Model loaded.")
     
     (
-        train_loader, 
-        test_loader_unlabeled,
-        test_loader_labeled,
+        traindata, 
+        testdata_unlabeled_from_train,
+        testdata,
         _,
-        val_loader,
+        _,
     ) = data.get_dataloaders(
-        per_device_train_batch_size=per_device_train_batch_size,
-        per_device_eval_batch_size=per_device_eval_batch_size,
+        per_device_train_batch_size=train_args.per_device_train_batch_size,
+        # used when output_dataset is False
+        per_device_eval_batch_size=train_args.per_device_eval_batch_size,
         drop_last=True,
         pin_memory=True,
-        num_workers=num_workers,
+        num_workers=data_args.num_workers,
+        output_dataset=True, 
     )
     
-    
+    train(
+        model=model,
+        train=traindata,
+        test_unlabeled_from_train=testdata_unlabeled_from_train,
+        test=testdata,
+        old_classes=data.old_classes,
+        **train_args.get_args(),
+    )
+    logger.info("Training completed.")
     
 
 if __name__ == '__main__':
-    pass
-
+    # too many params, we get them by yaml
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config", 
+        type=str,
+        help="The path to the configuration file, including the whole params.",
+    )
+    args = parser.parse_args()
+    
+    config = yaml.safe_load(open(args.config))
+    work(*split_params(config))
+     

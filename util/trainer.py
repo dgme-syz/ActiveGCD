@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import torch
 from torch import nn
@@ -16,6 +17,7 @@ from train_module import (
     info_nce_logits,
     SupConLoss
 )
+from eval_module import split_cluster_acc_v2
 
 def get_params_groups(model: nn.Module) -> list[dict]:
     """ Do not regularize biases nor Norm parameters """
@@ -35,10 +37,7 @@ def get_params_groups(model: nn.Module) -> list[dict]:
         {"params": not_reg, "weight_decay": 0.0},
     ]
     
-def compute_metrics(eval_preds: EvalPrediction) -> dict:
-    """ custom update metrics for test """
-    
-    pass
+
 
 
 class Trainer(transformers.Trainer):
@@ -46,11 +45,20 @@ class Trainer(transformers.Trainer):
     
     def __init__(
         self, 
+        train_dataset: Dataset, 
         eval_dataset: tuple[Dataset, Dataset],
+        labeled_classes: list[int],
+        optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR],
         *args, 
         **kwargs
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            eval_dataset=eval_dataset,
+            optimizers=optimizers, 
+            train_dataset=train_dataset,
+            *args, 
+            **kwargs
+        )
         # use args from parent class
         self.args: TrainingArgs  = self.args
         
@@ -61,32 +69,53 @@ class Trainer(transformers.Trainer):
             warmup_teacher_temp=self.args.warmup_teacher_temp,
             teacher_temp=self.args.teacher_temp,
         )
-        self.eval_dataset = eval_dataset
+        self.labeled_classes = labeled_classes
+        self.label_names = ["label"]
     
-    def prediction_step(
-        self, 
-        model, 
-        inputs, 
-        prediction_loss_only, 
-        ignore_keys = None
-    ):
-        self.evaluate(
-            eval_dataset=self.eval_dataset[0], 
-            metric_key_prefix="test"
-        )
-        self.evaluate(
-            eval_dataset=self.eval_dataset[1], 
-            metric_key_prefix="train unlabeled"
-        )
-    
+    def compute_metrics(self, eval_preds: EvalPrediction) -> dict:
+        """ custom update metrics for test """
+        
+        y_pred, y_true = eval_preds # not return inputs
+        if y_pred.shape != y_true.shape:
+            y_pred = np.argmax(y_pred, axis=1) # convert to class index
+        if y_pred.shape != y_true.shape:
+            raise ValueError("y_pred and y_true must have the same shape.")
+        
+        mask = np.isin(y_true, self.labeled_classes).astype(bool)
+        
+        res = {}
+        if self.args.eval_func in ["normal", "mixed"]:
+            prefix = "normal"
+            total_acc, old_acc, new_acc = split_cluster_acc_v2(
+                y_true=y_true, y_pred=y_pred, mask=mask, use_balanced=False
+            )
+            res.update({
+                f"{prefix}_total_acc": total_acc,
+                f"{prefix}_old_acc": old_acc,
+                f"{prefix}_new_acc": new_acc,
+            })
+            
+        if self.args.eval_func in ["balanced", "mixed"]:
+            prefix = "balanced"
+            total_acc, old_acc, new_acc = split_cluster_acc_v2(
+                y_true=y_true, y_pred=y_pred, mask=mask, use_balanced=True
+            )
+            res.update({
+                f"{prefix}_total_acc": total_acc,
+                f"{prefix}_old_acc": old_acc,
+                f"{prefix}_new_acc": new_acc,
+            })
+        
+        return res  
+            
     def compute_loss(
-        self, model, batch, return_outputs=False
+        self, model, inputs, return_outputs=False
     ):
         (
             images, 
             labels, 
             is_labeled
-        ) = batch["image"], batch["label"], batch["is_labeled"]
+        ) = inputs["image"], inputs["label"], inputs["is_labeled"]
         
         n_views, B, C, H, W = images.shape
         
@@ -151,10 +180,10 @@ class Trainer(transformers.Trainer):
 
 def train(
     model: nn.Sequential,
-    train_loader: DataLoader,
-    test_loader_labeled: DataLoader,
-    test_loader_unlabeled: DataLoader,
-    do_eval: bool = True,
+    train: Dataset,
+    test: Dataset,
+    test_unlabeled_from_train: Dataset,
+    old_classes: list[int], 
     learning_rate: float = 0.1, 
     momentum: float = 0.9,
     wight_decay: float = 1e-4,
@@ -164,6 +193,11 @@ def train(
     warmup_teacher_temp: float = 0.07, 
     teacher_temp: float = 0.04,
     memax_weight: float = 2., 
+    output_dir: str = "./saves", 
+    save_steps: int = 5, 
+    logging_steps: int = 10, 
+    logging_dir: str = "./logs", 
+    **kwargs, 
 ):
     # model = (feature_extractor, projection_head) expected
     if not (isinstance(model, nn.Sequential) and len(model) == 2):
@@ -185,7 +219,27 @@ def train(
         eta_min=learning_rate * 1e-3,
     )
     
-    
-    
-       
-                
+    training_args = TrainingArgs(
+        output_dir=output_dir, 
+        eval_strategy="epoch", 
+        warmup_teacher_temp_epochs=warmup_teacher_temp_epochs,
+        n_views=n_views,
+        warmup_teacher_temp=warmup_teacher_temp,
+        teacher_temp=teacher_temp,
+        memax_weight=memax_weight,
+        save_steps=save_steps,
+        eval_strategy="epoch", 
+        logging_steps=logging_steps, # for train stage
+        logging_dir=logging_dir,
+    )
+    trainer = Trainer(
+        model=model,
+        train_dataset=train, 
+        eval_dataset={
+            "test": test, 
+            "unlabled from train": test_unlabeled_from_train,
+        }, 
+        labeled_classes=old_classes, 
+        optimizers=(optimizer, exp_lr_scheduler), 
+    )
+    trainer.train()                

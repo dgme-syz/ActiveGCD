@@ -18,6 +18,7 @@ from .mapping import is_fgvc_dataset
 from .mapping import get_splits
 from .module_outputs import DatasetOutput
 from .module_outputs import DataLoaderOutput
+from .module_outputs import DataOutput
 from .augmix import get_transform
 
 
@@ -239,6 +240,7 @@ class GcdData(object):
         pin_memory: bool = True,
         num_workers: int = 0,
         sampler: Sampler | Iterable | None = None,
+        output_dataset: bool = False,
         train_tfm: Callable[[Image.Image], torch.Tensor] | None = None,
         test_tfm: Callable[[Image.Image], torch.Tensor] | None = None,
         **kwargs, 
@@ -308,18 +310,27 @@ class GcdData(object):
                 )
             ]
         ) # copy, not share the same memory with the original data
-        test_labeled, val = self.dataset_dict.test, self.dataset_dict.val
+        test, val = self.dataset_dict.test, self.dataset_dict.val
         
-        test_unlabeled = self.dataset_dict.train_unlabeled
+        test_unlabled_from_train = self.dataset_dict.train_unlabeled
         train_labeled_ind_mapping = self.dataset_dict.train_labeled
         
         # set the transform
         train.set_transform(train_tfm)
-        test_unlabeled.set_transform(test_tfm)
-        test_labeled.set_transform(test_tfm)
+        test_unlabled_from_train.set_transform(test_tfm)
+        test.set_transform(test_tfm)
         train_labeled_ind_mapping.set_transform(test_tfm)
         if val is not None:
             val.set_transform(test_tfm)
+        
+        if output_dataset:
+            return DataOutput(
+                train=train,
+                test_unlabled_from_train=test_unlabled_from_train,
+                test=test,
+                train_labeled_ind_mapping=train_labeled_ind_mapping,
+                val=val,
+            )
         
         train_loader = DataLoader(
             train,
@@ -331,16 +342,16 @@ class GcdData(object):
             shuffle=False, 
         )
         
-        test_loader_unlabeled = DataLoader(
-            test_unlabeled,
+        test_loader_unlabeled_from_train = DataLoader(
+            test_unlabled_from_train,
             batch_size=per_device_eval_batch_size,
             pin_memory=pin_memory,
             num_workers=num_workers,
             shuffle=False,
         )
         
-        test_loader_labeled = DataLoader(
-            test_labeled,
+        test_loader = DataLoader(
+            test,
             batch_size=per_device_eval_batch_size,
             pin_memory=pin_memory,
             num_workers=num_workers,
@@ -368,8 +379,8 @@ class GcdData(object):
         
         return DataLoaderOutput(
             train_loader=train_loader,
-            test_loader_unlabeled=test_loader_unlabeled,
-            test_loader_labeled=test_loader_labeled,
+            test_loader_unlabeled_from_train=test_loader_unlabeled_from_train,
+            test_loader=test_loader,
             train_labeled_loader_ind_mapping=train_labeled_loader_ind_mapping,
             val_loader=val_loader,
         )
