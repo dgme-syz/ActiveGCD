@@ -1,5 +1,6 @@
 import math
-from typing import Optional
+from typing import Optional, Any
+import warnings
 
 import torch
 from torch import nn
@@ -12,12 +13,13 @@ import torch.nn.functional as F
 from transformers import EvalPrediction
 
 from .training_args import TrainingArgs
-from train_module import (
+from .train_module import (
     DistillLoss,
     info_nce_logits,
     SupConLoss
 )
-from eval_module import split_cluster_acc_v2
+from .eval_module import split_cluster_acc_v2
+from .log import logger
 
 def get_params_groups(model: nn.Module) -> list[dict]:
     """ Do not regularize biases nor Norm parameters """
@@ -45,23 +47,20 @@ class Trainer(transformers.Trainer):
     
     def __init__(
         self, 
-        train_dataset: Dataset, 
-        eval_dataset: tuple[Dataset, Dataset],
+        train_dataloader: DataLoader, 
+        eval_dataloader: dict[str, DataLoader],
         labeled_classes: list[int],
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR],
         *args, 
         **kwargs
     ):
         super().__init__(
-            eval_dataset=eval_dataset,
-            optimizers=optimizers, 
-            train_dataset=train_dataset,
-            *args, 
-            **kwargs
+            optimizers=optimizers, *args, **kwargs
         )
         # use args from parent class
-        self.args: TrainingArgs  = self.args
-        
+        self.args: TrainingArgs = self.args
+        self.train_dataloader = train_dataloader
+        self.eval_dataloader = eval_dataloader
         self.cluster_criterion = DistillLoss(
             warmup_teacher_temp_epochs=self.args.warmup_teacher_temp_epochs,
             n_epochs=self.args.num_train_epochs,
@@ -71,8 +70,21 @@ class Trainer(transformers.Trainer):
         )
         self.labeled_classes = labeled_classes
         self.label_names = ["label"]
+        self.compute_metrics = self.compute_metrics_fn
     
-    def compute_metrics(self, eval_preds: EvalPrediction) -> dict:
+    def get_train_dataloader(self):
+        """ use custom dataloader """
+        
+        return self.accelerator.prepare(self.train_dataloader)
+    
+    def get_eval_dataloader(self, eval: str):
+        """ use custom dataloader """
+        if not isinstance(eval, str):
+            raise NotImplementedError("Unexpected!")
+        
+        return self.accelerator.prepare(self.eval_dataloader[eval])
+    
+    def compute_metrics_fn(self, eval_preds: EvalPrediction) -> dict:
         """ custom update metrics for test """
         
         y_pred, y_true = eval_preds # not return inputs
@@ -107,9 +119,49 @@ class Trainer(transformers.Trainer):
             })
         
         return res  
-            
+    
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        prediction_loss_only: bool = False,
+        ignore_keys: Optional[list[str]] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform an evaluation step on `model` using `inputs`.
+        Custom Version does not return loss.
+
+        Args:
+            model (`nn.Module`):
+                The model to evaluate.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (`bool`):
+                Whether or not to return the loss only.
+            ignore_keys (`List[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+
+        Return:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
+            logits and labels (each being optional).
+        """
+        
+        if prediction_loss_only:
+            prediction_loss_only = False
+        
+        images, labels = inputs["image"], inputs["label"]
+        with torch.no_grad():
+            _, logits = model(images)
+        
+        logits = logits.detach()
+        return (None, logits, labels)
+        
     def compute_loss(
-        self, model, inputs, return_outputs=False
+        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], return_outputs=False
     ):
         (
             images, 
@@ -117,26 +169,29 @@ class Trainer(transformers.Trainer):
             is_labeled
         ) = inputs["image"], inputs["label"], inputs["is_labeled"]
         
-        n_views, B, C, H, W = images.shape
-        
-        labels = labels.to(model.device)
-        is_labeled = is_labeled.to(model.device).bool()
+        n_views = len(images)
+        device = next(model[0].parameters()).device
+        labels = labels.to(device)
+        is_labeled = is_labeled.to(device).bool()
         # reshape to (n_views * B, C, H, W)
-        images = torch.cat(images, dim=0).to(model.device)
+        images = torch.cat(images, dim=0).to(device)
+        
+        if len(images) == 0:
+            raise ValueError("Unexpected!")
         
         student_proj, student_outs = model(images) # stdent_proj: (n_views * B, hidden_dim)
         teacher_outs = student_outs.detach()
         
         # 1. supervised clustering
         supervised_logits = torch.cat(
-            [student_outs[i][is_labeled] / 0.1 for i in range(n_views)], dim=0
+            [s[is_labeled] / 0.1 for s in student_outs.chunk(n_views)], dim=0
         )
         supervised_labels = torch.cat(
             [labels[is_labeled] for _ in range(n_views)], dim=0
         )
         supervised_cluster_loss = nn.CrossEntropyLoss()(
             input=supervised_logits, target=supervised_labels
-        )
+        ) if any(is_labeled) else 0.
         
         # 2. unsupervised clustering
         unsupervised_cluster_loss = self.cluster_criterion(
@@ -157,13 +212,14 @@ class Trainer(transformers.Trainer):
         
         # 4. supervised representation learning
         student_proj = torch.cat(
-            [student_proj[i][is_labeled] for i in range(n_views)], dim=1
-        ) # (B, hidden_dim * n_views)
+            [s[is_labeled].unsqueeze(1) for s in student_proj.chunk(n_views)], dim=1
+        ) # B x n_views x embed_dim
+        
         student_proj = F.normalize(student_proj, dim=-1)
         sup_con_labels = labels[is_labeled]
         sup_con_loss = SupConLoss()(
             features=student_proj, labels=sup_con_labels
-        )
+        ) if any(is_labeled) else 0.
         
         # 5. total loss
         loss = (
@@ -175,30 +231,55 @@ class Trainer(transformers.Trainer):
         
         return (loss, student_outs) if return_outputs else loss
 
-                
-
-
 def train(
     model: nn.Sequential,
-    train: Dataset,
-    test: Dataset,
-    test_unlabeled_from_train: Dataset,
+    train: DataLoader,
+    test: DataLoader,
+    test_unlabeled_from_train: DataLoader,
     old_classes: list[int], 
-    learning_rate: float = 0.1, 
-    momentum: float = 0.9,
-    wight_decay: float = 1e-4,
-    epochs: int = 200,
-    warmup_teacher_temp_epochs: int = 30, 
-    n_views: int = 2,
-    warmup_teacher_temp: float = 0.07, 
-    teacher_temp: float = 0.04,
-    memax_weight: float = 2., 
+    learning_rate: float, 
+    momentum: float,
+    weight_decay: float,
+    epochs: int,
+    warmup_teacher_temp_epochs: int, 
+    n_views: int,
+    warmup_teacher_temp: float, 
+    teacher_temp: float,
+    memax_weight: float, 
+    logging_steps: int, 
     output_dir: str = "./saves", 
-    save_steps: int = 5, 
-    logging_steps: int = 10, 
     logging_dir: str = "./logs", 
     **kwargs, 
 ):
+    """
+    Train the model for the specified number of epochs, evaluate the model, 
+    and log the results. The function supports incremental learning, 
+    semi-supervised learning, and regularization techniques such as MEMAX.
+
+    Args:
+        model (`nn.Sequential`): The neural network model, typically a `nn.Sequential` object.
+        train (`DataLoader`): `DataLoader` for the training set, provides batches of training data.
+        test (`DataLoader`): `DataLoader` for the test set, used for evaluating model performance.
+        test_unlabeled_from_train (`DataLoader`): `DataLoader` for unlabeled data from the training set.
+        old_classes (list[`int`]): List of old classes, used in incremental learning.
+        learning_rate (`float`): Learning rate for the optimizer.
+        momentum (`float`): Momentum term for the optimizer.
+        weight_decay (`float`): Weight decay parameter for L2 regularization.
+        epochs (`int`): Total number of training epochs.
+        warmup_teacher_temp_epochs (`int`): Number of epochs for warming up the teacher model's temperature.
+        n_views (`int`): Number of augmented views of data used in self-supervised learning.
+        warmup_teacher_temp (`float`): Initial teacher model temperature value for warmup.
+        teacher_temp (`float`): Final teacher model temperature for controlling softmax smoothness.
+        memax_weight (`float`): Weight for MEMAX regularization.
+        logging_steps (`int`): Number of steps between each logging of training progress.
+        output_dir (`str`, optional): Directory for saving model checkpoints (default is `./saves`).
+        logging_dir (`str`, optional): Directory for saving logs (default is `./logs`).
+        **kwargs: Additional keyword arguments for customization (e.g., device settings, optimizer configurations).
+
+    Returns:
+        None
+    """
+    
     # model = (feature_extractor, projection_head) expected
     if not (isinstance(model, nn.Sequential) and len(model) == 2):
         raise ValueError(
@@ -211,7 +292,7 @@ def train(
         params=params_groups,
         lr=learning_rate,
         momentum=momentum,
-        weight_decay=wight_decay,
+        weight_decay=weight_decay,
     )
     exp_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer=optimizer,
@@ -227,19 +308,23 @@ def train(
         warmup_teacher_temp=warmup_teacher_temp,
         teacher_temp=teacher_temp,
         memax_weight=memax_weight,
-        save_steps=save_steps,
-        eval_strategy="epoch", 
+        save_strategy="epoch",
         logging_steps=logging_steps, # for train stage
         logging_dir=logging_dir,
+        num_train_epochs=epochs,
+        bf16=True, 
     )
+    
     trainer = Trainer(
         model=model,
-        train_dataset=train, 
-        eval_dataset={
+        train_dataloader=train,
+        eval_dataloader={
             "test": test, 
             "unlabled from train": test_unlabeled_from_train,
         }, 
+        eval_dataset={"test": None, "unlabled from train": None}, 
         labeled_classes=old_classes, 
         optimizers=(optimizer, exp_lr_scheduler), 
+        args=training_args,
     )
     trainer.train()                

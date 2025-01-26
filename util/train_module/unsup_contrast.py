@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 def info_nce_logits(
     features: torch.Tensor,

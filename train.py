@@ -29,7 +29,9 @@ def get_model(
             p.requires_grad = True
         else:
             p.requires_grad = False
-                
+    precision_type = next(backbone.parameters()).dtype
+    logger.info(f"Model use {precision_type}")
+    
     model = nn.Sequential(
         backbone, 
         DINOHead(
@@ -38,20 +40,20 @@ def get_model(
             nlayers=3,
         )
     )
-    
     return model.to(device)
 
 
 def work(train_args: TrainConfig, data_args: DatasetConfig):
     """ Process the dataset and call the training function. """
     
+    print(train_args)
+    print(data_args)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
     
     data = GcdData(
         dataset=data_args.dataset,
-        device=device,
         ssb_ratio=data_args.ssb_ratio,
         ssb_num_labels=data_args.ssb_num_labels,
         use_ssb_splits=data_args.use_ssb_splits,
@@ -61,7 +63,7 @@ def work(train_args: TrainConfig, data_args: DatasetConfig):
     num_labeled_cls, num_unlabeled_cls = len(data.old_classes), len(data.new_classes)
     mlp_output_dim = num_labeled_cls + num_unlabeled_cls
     logger.info(
-        f"{data_args.dataset} loaded, include {num_labeled_cls} labeled classes" 
+        f"{data_args.dataset} loaded, include {num_labeled_cls} labeled classes " 
         f"and {num_unlabeled_cls} unlabeled classes."
     )
     
@@ -69,9 +71,9 @@ def work(train_args: TrainConfig, data_args: DatasetConfig):
     logger.info("Model loaded.")
     
     (
-        traindata, 
-        testdata_unlabeled_from_train,
-        testdata,
+        train_loader, 
+        test_loader_unlabeled_from_train,
+        test_loader,
         _,
         _,
     ) = data.get_dataloaders(
@@ -81,14 +83,14 @@ def work(train_args: TrainConfig, data_args: DatasetConfig):
         drop_last=True,
         pin_memory=True,
         num_workers=data_args.num_workers,
-        output_dataset=True, 
+        bf16=True,
     )
     
     train(
         model=model,
-        train=traindata,
-        test_unlabeled_from_train=testdata_unlabeled_from_train,
-        test=testdata,
+        train=train_loader,
+        test_unlabeled_from_train=test_loader_unlabeled_from_train,
+        test=test_loader,
         old_classes=data.old_classes,
         **train_args.get_args(),
     )

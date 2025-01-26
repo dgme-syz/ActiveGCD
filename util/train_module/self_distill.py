@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import numpy as np
-
+import torch.nn.functional as F
 
 class DistillLoss(nn.Module):
     def __init__(
@@ -47,5 +47,26 @@ class DistillLoss(nn.Module):
         epoch: int,
     ):
         """ Compute the distillation loss between the student and teacher outputs.  """
-
-        pass
+        
+        # srtudent_outputs: [bsz * n_views, classes]
+        student_outs = student_outputs / self.student_temp
+        student_outs = student_outs.chunk(self.n_crops)
+        
+        temp = self.teacher_temp_schedule[epoch]
+        teacher_outs = F.softmax(teacher_outputs / temp, dim=-1)
+        teacher_outs = teacher_outs.detach().chunk(self.n_crops)
+        
+        loss, n_terms = 0, 0
+        for i in range(self.n_crops):
+            for j in range(self.n_crops):
+                if i == j:
+                    continue # skip the same crop
+                loss += F.kl_div(
+                    input=F.log_softmax(student_outs[i], dim=-1), # log_softmax
+                    target=teacher_outs[j], # softmax
+                    reduction='batchmean',
+                ) # equal to `torch.sum(-t(after softmax) * F.log_softmax(s[v](logits), dim=-1), dim=-1)`
+                n_terms += 1
+                
+        return loss / n_terms
+                

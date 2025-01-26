@@ -27,7 +27,18 @@ class CLViewGen(object):
         
         return [self.base_tfm(x) for _ in range(self.n_views)]
 
-
+def func(
+    x: dict, 
+    function: Callable[[Image.Image], torch.Tensor], 
+    image: str, 
+    label: str, 
+) -> dict:
+    # update, and then del image, label from x
+    img = [function(xx) for xx in x[image]]
+    lab = x[label]
+    x.pop(image), x.pop(label)
+    
+    return {"image": img, "label": lab, **x}
 
 def get_transform(
     name: str = 'CIFAR10',
@@ -64,18 +75,12 @@ def get_transform(
         train_transform = CLViewGen(train_transform, n_views=n_views)
     
     image, label = get_keys(name=name)
-    def func(x: dict, function: Callable[[Image.Image], torch.Tensor]) -> dict:
-        # update, and then del image, label from x
-        img = [function(xx) for xx in x[image]]
-        lab = x[label]
-        x.pop(image), x.pop(label)
-        
-        return {"image": img, "label": lab, **x}
+    
     
     train_transform = partial(
-        func, function=train_transform)
+        func, function=train_transform, image=image, label=label)
     test_transform = partial(
-        func, function=test_transform)
+        func, function=test_transform, image=image, label=label)
     
     return train_transform, test_transform
 

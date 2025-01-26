@@ -78,4 +78,13 @@ class TrainingArgs(TrainingArguments):
             )
         }
     )
-        
+    
+    warmup_teacher_temp_epochs: int = field(
+        default=30, 
+        metadata={
+            "help": (
+                "The number of epochs to warm up the teacher temperature. Gradually increases "
+                "the temperature of the teacher model during training."
+            )
+        }
+    )

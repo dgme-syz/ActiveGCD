@@ -25,8 +25,8 @@ class SupConLoss(torch.nn.Module):
         """
 
         device = (torch.device('cuda')
-                  if features.is_cuda
-                  else torch.device('cpu'))
+            if features.is_cuda else torch.device('cpu')
+        )
 
         if len(features.shape) < 3:
             raise ValueError('`features` needs to be [bsz, n_views, ...],'
@@ -61,7 +61,8 @@ class SupConLoss(torch.nn.Module):
         # compute logits
         anchor_dot_contrast = torch.div(
             torch.matmul(anchor_feature, contrast_feature.T),
-            self.temperature)
+            self.temperature
+        )
 
         # for numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)

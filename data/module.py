@@ -240,7 +240,6 @@ class GcdData(object):
         pin_memory: bool = True,
         num_workers: int = 0,
         sampler: Sampler | Iterable | None = None,
-        output_dataset: bool = False,
         train_tfm: Callable[[Image.Image], torch.Tensor] | None = None,
         test_tfm: Callable[[Image.Image], torch.Tensor] | None = None,
         **kwargs, 
@@ -298,16 +297,16 @@ class GcdData(object):
             warnings.warn(
                 f"The name in kwargs is different from the name in the dataset"
             )
-            
+        
         # add one new column to mark is labeled or not
         train = concatenate_datasets(
             [
                 self.dataset_dict.train_labeled.map(
                     function=lambda x: {'is_labeled': [1]*len(x[next(iter(x))]), **x}, batched=True
-                ), 
+                ).shuffle(), 
                 self.dataset_dict.train_unlabeled.map(
                     function=lambda x: {'is_labeled': [0]*len(x[next(iter(x))]), **x}, batched=True
-                )
+                ).shuffle()
             ]
         ) # copy, not share the same memory with the original data
         test, val = self.dataset_dict.test, self.dataset_dict.val
@@ -322,23 +321,14 @@ class GcdData(object):
         train_labeled_ind_mapping.set_transform(test_tfm)
         if val is not None:
             val.set_transform(test_tfm)
-        
-        if output_dataset:
-            return DataOutput(
-                train=train,
-                test_unlabled_from_train=test_unlabled_from_train,
-                test=test,
-                train_labeled_ind_mapping=train_labeled_ind_mapping,
-                val=val,
-            )
-        
+         
         train_loader = DataLoader(
             train,
             batch_size=per_device_train_batch_size,
             drop_last=drop_last,
             pin_memory=pin_memory,
             num_workers=num_workers,
-            sampler=sampler,
+            # sampler=sampler,
             shuffle=False, 
         )
         
