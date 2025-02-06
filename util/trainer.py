@@ -161,7 +161,7 @@ class Trainer(transformers.Trainer):
         return (None, logits, labels)
         
     def compute_loss(
-        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], return_outputs=False
+        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], return_outputs=False, **kwargs
     ):
         (
             images, 

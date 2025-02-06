@@ -1,1 +1,1 @@
-# ActiveGCD
+# SimGCD

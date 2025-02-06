@@ -103,6 +103,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--config", 
         type=str,
+        default='./config/train.yaml', 
         help="The path to the configuration file, including the whole params.",
     )
     args = parser.parse_args()

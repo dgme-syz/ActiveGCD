@@ -22,3 +22,4 @@ rad.json
 TestResults.xml
 *.ipynb
 *.pyc
+saves/*
